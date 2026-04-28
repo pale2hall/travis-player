@@ -1,0 +1,32 @@
+# local virtual env
+.venv/
+venv/
+
+# python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# logs and runtime artefacts
+logs/
+*.log
+
+# user-local settings (per-machine tuning + window geometry)
+settings.json
+
+# user-saved presets are local — comment this out if you want to commit shared ones
+presets/
+
+# media (do not commit copyrighted test clips)
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+
+# editor / OS / IDE
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.claude/
