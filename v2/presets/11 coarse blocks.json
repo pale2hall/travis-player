@@ -1,0 +1,22 @@
+{
+  "engine": "auto",
+  "mv_block_px": 32,
+  "mv_gain": 20,
+  "tile_px": 128,
+  "iframe_hold": true,
+  "alpha_floor": 0.0,
+  "threshold": 0.04,
+  "padding_px_1080": 0,
+  "feather_px_1080": 20,
+  "feather_falloff": 1.0,
+  "min_region_px_1080": 0,
+  "push_full": 0,
+  "persist_seconds": 0.5,
+  "scene_cut_ignore": true,
+  "scene_cut_thresh": 0.7,
+  "proc_div": 8,
+  "debug_mode": 0,
+  "resync_interval_s": 5.0,
+  "resync_threshold_ms": 120,
+  "_note": "chunky, cheap, low-detail mask (big macroblock grid + big tiles)."
+}

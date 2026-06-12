@@ -13,9 +13,13 @@ logs/
 
 # user-local settings (per-machine tuning + window geometry)
 settings.json
+v2/settings_v2.json
 
-# user-saved presets are local — comment this out if you want to commit shared ones
-presets/
+# v1 user presets are local; v2/presets/ ships curated showcase presets and IS committed
+/presets/
+
+# spike outputs (heatmap PNGs etc.)
+v2/spikes/out/
 
 # media (do not commit copyrighted test clips)
 *.mp4

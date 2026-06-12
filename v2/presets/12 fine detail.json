@@ -1,0 +1,22 @@
+{
+  "engine": "auto",
+  "mv_block_px": 8,
+  "mv_gain": 32,
+  "tile_px": 24,
+  "iframe_hold": true,
+  "alpha_floor": 0.0,
+  "threshold": 0.04,
+  "padding_px_1080": 0,
+  "feather_px_1080": 4,
+  "feather_falloff": 1.0,
+  "min_region_px_1080": 0,
+  "push_full": 0,
+  "persist_seconds": 0.5,
+  "scene_cut_ignore": true,
+  "scene_cut_thresh": 0.7,
+  "proc_div": 8,
+  "debug_mode": 0,
+  "resync_interval_s": 5.0,
+  "resync_threshold_ms": 120,
+  "_note": "high-resolution mask that hugs edges (small grid + small tiles)."
+}
