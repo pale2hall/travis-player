@@ -83,14 +83,28 @@ git clone <this repo> ; cd travis-player
 python -m venv .venv
 .venv\Scripts\pip install PyQt6 opencv-python numpy av
 # optional GPU backend:  .venv\Scripts\pip install "cupy-cuda12x[ctk]"
+```
 
-.\launch_v2.ps1 "path\to\video.mp4"
+**Desktop shortcut** (recommended) — creates a `travis-player` icon on your Desktop
+that opens the app empty (no console window):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\install_shortcut.ps1
+```
+
+Double-click it, then **drag a video file or stream URL onto the window**. That's it.
+
+Or from a terminal:
+
+```powershell
+.\launch_v2.ps1                                     # opens empty, drag a video in
+.\launch_v2.ps1 "path\to\video.mp4"                 # autoplay a file
 .\launch_v2.ps1 "https://example.com/stream.m3u8"   # streams work too
 ```
 
-Or directly: `.venv\Scripts\python -m v2 "video.mp4"`.
+Or directly: `.venv\Scripts\python -m v2` (add a path/URL to autoplay one).
 
-Drag-and-drop a file or a stream URL onto either window to swap sources live.
+Drag-and-drop a file or a stream URL onto either window any time to swap sources live.
 
 ### Controls
 

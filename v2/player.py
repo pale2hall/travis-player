@@ -14,10 +14,10 @@ import logging
 import os
 import time
 
-from PyQt6.QtCore import QPoint, QRect, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QRectF, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QMouseEvent,
-    QPainter, QPolygon, QRegion,
+    QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QImage, QKeyEvent, QMouseEvent,
+    QPainter, QPen, QPolygon, QRegion,
 )
 from PyQt6.QtWidgets import QApplication, QWidget
 
@@ -35,7 +35,7 @@ class PlayerWindow(QWidget):
     stats_changed = pyqtSignal(str)
     stream_info_changed = pyqtSignal(dict)
 
-    def __init__(self, source: str, params: Params) -> None:
+    def __init__(self, source: str | None, params: Params) -> None:
         super().__init__()
         self.params = params
         self._source = source
@@ -67,12 +67,14 @@ class PlayerWindow(QWidget):
         # shared state across the worker/GUI boundary
         self._clock = MasterClock()
         self._compositor = Compositor()
-        self._start_worker(source)
+        self._worker = None
+        self._thread = None
+        self._audio = None
+        self._swapping = False
 
-        self._audio = AudioController(source)
-        self._audio.start()
-        if params.volume != 100:
-            self._audio.set_volume(params.volume)
+        # start empty (idle) when no source given — the window waits for a drop
+        if source:
+            self.load_source(source)
 
     # ── worker lifecycle ──
     def _start_worker(self, source: str) -> None:
@@ -141,8 +143,38 @@ class PlayerWindow(QWidget):
             p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             with self._compositor.lock:
                 p.drawImage(dest, self._image)
+        elif self._worker is None:
+            self._paint_drop_hint(p)
 
         self._paint_chrome(p)
+
+    def _paint_drop_hint(self, p: QPainter) -> None:
+        """Idle state (no source yet): a soft panel inviting a drop."""
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        r = self.rect()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(18, 18, 22, 205)))
+        p.drawRoundedRect(r.adjusted(8, 8, -8, -8), 16, 16)
+        # dashed inner frame
+        dashed = QPen(QColor(120, 130, 160, 160), 2, Qt.PenStyle.DashLine)
+        p.setPen(dashed)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(r.adjusted(28, 28, -28, -28), 12, 12)
+        # text
+        p.setPen(QColor(220, 225, 240))
+        f = QFont()
+        f.setPointSize(15)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(r), Qt.AlignmentFlag.AlignCenter,
+                   "travis-player\n\n⊕  drop a video file or stream URL here")
+        f.setPointSize(9)
+        f.setBold(False)
+        p.setFont(f)
+        p.setPen(QColor(150, 155, 170))
+        p.drawText(QRectF(r.adjusted(0, r.height() - 64, 0, 0)),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                   "or pass one on the command line  ·  [Q] quit")
 
     def _paint_chrome(self, p: QPainter) -> None:
         if self._hovered and not self.isFullScreen():
@@ -414,22 +446,24 @@ class PlayerWindow(QWidget):
         try:
             # 1. SILENCE the old audio immediately, then fully kill it BEFORE we start
             #    anything new — otherwise it keeps playing through the worker teardown and
-            #    can overlap with the next stream's audio.
+            #    can overlap with the next stream's audio. (None on the very first load.)
             old_audio = self._audio
             self._audio = None
-            try:
-                old_audio.set_paused(True)   # instant mute
-            except Exception:
-                log.exception("pausing old audio failed")
-            try:
-                old_audio.stop()             # terminate (then kill on timeout) — mpv is gone
-            except Exception:
-                log.exception("audio stop failed")
+            if old_audio is not None:
+                try:
+                    old_audio.set_paused(True)   # instant mute
+                except Exception:
+                    log.exception("pausing old audio failed")
+                try:
+                    old_audio.stop()             # terminate (then kill on timeout) — mpv is gone
+                except Exception:
+                    log.exception("audio stop failed")
 
-            # 2. tear down the old worker/decoder
-            self._worker.stop()
-            self._thread.quit()
-            self._thread.wait(2000)
+            # 2. tear down the old worker/decoder (none on the very first load)
+            if self._worker is not None:
+                self._worker.stop()
+                self._thread.quit()
+                self._thread.wait(2000)
 
             # 3. bring up the new stream
             self._source = source
@@ -451,9 +485,10 @@ class PlayerWindow(QWidget):
             self.params.save()
         except Exception:
             log.exception("settings save failed")
-        self._worker.stop()
-        self._thread.quit()
-        self._thread.wait(2000)
+        if self._worker is not None:
+            self._worker.stop()
+            self._thread.quit()
+            self._thread.wait(2000)
         try:
             if self._audio is not None:
                 self._audio.stop()

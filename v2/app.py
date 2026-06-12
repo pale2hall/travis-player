@@ -40,18 +40,15 @@ def _setup_logging() -> None:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: python -m v2 <video.mp4|url>", file=sys.stderr)
-        return 2
-    source = sys.argv[1]
-    # local files must exist; URLs (have a scheme) pass through to ffmpeg
-    if "://" not in source and not Path(source).exists():
+    # source is optional — launch empty and drag a video/URL in, or pass one
+    source: str | None = sys.argv[1] if len(sys.argv) > 1 else None
+    if source and "://" not in source and not Path(source).exists():
         print(f"not found: {source}", file=sys.stderr)
         return 2
 
     _setup_logging()
     log.info("=" * 60)
-    log.info("travis-player v2 starting  source=%s", source)
+    log.info("travis-player v2 starting  source=%s", source or "(idle — waiting for a drop)")
 
     audio.set_job_handle(audio.create_job_for_children())
 
