@@ -9,13 +9,30 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QScrollArea, QSlider, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 
+from . import gpu
 from . import params as P
 from .params import Params, auto_params, list_presets, safe_preset_name
 from .player import PlayerWindow
+
+
+class PresetCombo(QComboBox):
+    """Dropdown that re-scans the presets dir each time it's opened, so presets
+    added or deleted outside the app show up without a restart."""
+
+    def showPopup(self) -> None:
+        current = self.currentText()
+        self.blockSignals(True)
+        self.clear()
+        self.addItems(list_presets())
+        idx = self.findText(current)
+        if idx >= 0:
+            self.setCurrentIndex(idx)
+        self.blockSignals(False)
+        super().showPopup()
 
 
 class ControlPanel(QWidget):
@@ -116,7 +133,7 @@ class ControlPanel(QWidget):
     def _build_presets(self) -> None:
         lay = self._group("Presets")
         row = QHBoxLayout()
-        self.preset_dd = QComboBox()
+        self.preset_dd = PresetCombo()
         self.preset_dd.addItems(list_presets())
         row.addWidget(self.preset_dd, stretch=2)
         btn = QPushButton("Load")
@@ -180,7 +197,6 @@ class ControlPanel(QWidget):
         self.cb_hold.toggled.connect(self._on_hold)
         lay.addWidget(self.cb_hold)
 
-        from . import gpu
         if gpu.available():
             self.cb_gpu = QCheckBox(f"GPU compositing — {gpu.device_name()}")
             self.cb_gpu.setChecked(self.params.use_gpu)
@@ -238,13 +254,11 @@ class ControlPanel(QWidget):
         lay = self._group("Playback")
         self.lbl_pos = QLabel("0:00 / 0:00")
         lay.addWidget(self.lbl_pos)
+        self._seeking = False
         self.sl_seek = QSlider(Qt.Orientation.Horizontal)
         self.sl_seek.setRange(0, 1000)
-        self.sl_seek.sliderReleased.connect(
-            lambda: self.player.seek_to(self.sl_seek.value() / 1000.0))
-        self.sl_seek.sliderPressed.connect(lambda: setattr(self, "_seeking", True))
-        self.sl_seek.sliderReleased.connect(lambda: setattr(self, "_seeking", False))
-        self._seeking = False
+        self.sl_seek.sliderPressed.connect(self._on_seek_pressed)
+        self.sl_seek.sliderReleased.connect(self._on_seek_released)
         lay.addWidget(self.sl_seek)
         row = QHBoxLayout()
         row.addWidget(QLabel("Volume"))
@@ -264,10 +278,16 @@ class ControlPanel(QWidget):
         b2.clicked.connect(self.player.toggle_fullscreen)
         row.addWidget(b2)
         b3 = QPushButton("Quit")
-        from PyQt6.QtWidgets import QApplication
         b3.clicked.connect(lambda: QApplication.instance().quit())
         row.addWidget(b3)
         self.v.addLayout(row)
+
+    def _on_seek_pressed(self) -> None:
+        self._seeking = True
+
+    def _on_seek_released(self) -> None:
+        self._seeking = False
+        self.player.seek_to(self.sl_seek.value() / 1000.0)
 
     # ── setters (param writes; _refresh + save handled by the slider handler) ──
     def _set_mv_gain(self, v): self.params.mv_gain = float(v)
@@ -292,7 +312,7 @@ class ControlPanel(QWidget):
         self.lbl_status.setText(text)
 
     def _on_position(self, pos_ms: float, dur_ms: float) -> None:
-        if getattr(self, "_seeking", False):
+        if self._seeking:
             return
         def _fmt(ms):
             s = int(ms / 1000)

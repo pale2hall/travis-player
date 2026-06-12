@@ -347,7 +347,8 @@ class PlayerWindow(QWidget):
             QApplication.instance().quit()
         elif k == Qt.Key.Key_Space:
             self.set_paused(not self.params.paused)
-        elif k == Qt.Key.Key_F11 or k == Qt.Key.Key_F:
+        elif k == Qt.Key.Key_F11 or (
+                k == Qt.Key.Key_F and e.modifiers() == Qt.KeyboardModifier.NoModifier):
             self.toggle_fullscreen()
         elif k == Qt.Key.Key_R:
             self.reset_geometry()

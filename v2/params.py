@@ -111,10 +111,8 @@ class Params:
     debug_mode: int = VIEW_NORMAL
     paused: bool = False              # transient
 
-    # --- audio / sync ---
+    # --- audio ---
     volume: int = 100
-    resync_interval_s: float = 5.0    # how often the clock checks A/V alignment
-    resync_threshold_ms: float = 120  # drift beyond this triggers a catch-up
 
     # --- window geometry (auto-saved; -1 = default) ---
     controls_x: int = -1

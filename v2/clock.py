@@ -6,9 +6,6 @@ video chase a single wall-clock master (a proxy for the audio clock, since mpv p
 time): each decoded frame is presented against `clock.now()`. frames that fall behind are
 dropped to catch up, frames that run ahead wait. that locks A/V by construction without
 needing IPC readback from mpv.
-
-the audio sidecar is still periodically nudged (clock.audio_resync) so a hard hiccup in mpv
-can't drift unbounded.
 """
 
 from __future__ import annotations

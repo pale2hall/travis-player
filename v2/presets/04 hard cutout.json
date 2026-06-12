@@ -16,7 +16,5 @@
   "scene_cut_thresh": 0.7,
   "proc_div": 8,
   "debug_mode": 0,
-  "resync_interval_s": 5.0,
-  "resync_threshold_ms": 120,
   "_note": "crisp opaque moving subjects with a hard edge (push-to-full + sharp falloff)."
 }

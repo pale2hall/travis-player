@@ -14,12 +14,13 @@ import cv2
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from . import gpu
 from . import params as P
 from .clock import MasterClock
 from .compose import Compositor
 from .decode import Decoder
 from .mask import MaskBuilder
-from .motion import DiffActivity, activity_from_mvs
+from .motion import DiffActivity, activity_from_mvs, grid_dims
 from .params import Params
 
 log = logging.getLogger("travis.v2")
@@ -43,7 +44,6 @@ class FrameWorker(QObject):
         self._decoder = Decoder(source)
         self._mask = MaskBuilder()
         self._diff = DiffActivity()
-        self._last_activity: np.ndarray | None = None
 
     # ── thread-safe controls ──
     def request_seek(self, frac: float) -> None:
@@ -123,7 +123,6 @@ class FrameWorker(QObject):
                 p95 = sorted(proc_times)[int(len(proc_times) * 0.95)] * 1000
                 real_fps = 60 / max(1e-6, time.monotonic() - stats_t)
                 avg_dirty = sum(dirty_counts) / len(dirty_counts)
-                from . import gpu
                 gpu_on = self.params.use_gpu and gpu.available()
                 log.info("perf: proc=%.1fms avg / %.1fms p95  fps=%.1f  drop=%d  "
                          "dirty=%.0f tiles  active=%.0f%%  eng=%s  gpu=%s",
@@ -155,12 +154,10 @@ class FrameWorker(QObject):
         elif frame.mvs is not None:
             activity = activity_from_mvs(frame.mvs, w, h, block, p.mv_gain)
         else:  # MV engine on an MV-less frame (I-frame)
-            from .motion import grid_dims
             gw, gh = grid_dims(w, h, block)
             activity = np.zeros((gh, gw), dtype=np.uint8)
             if not p.iframe_hold:
                 self._mask.reset_persistence()
-        self._last_activity = activity
 
         # 2. shape into an alpha grid (v1's mask math, at grid res)
         frame_period = 1.0 / max(1.0, self._decoder.fps)

@@ -21,7 +21,6 @@ BASE = dict(
     min_region_px_1080=0, push_full=0,
     persist_seconds=0.5, scene_cut_ignore=True, scene_cut_thresh=0.7,
     proc_div=8, debug_mode=0,
-    resync_interval_s=5.0, resync_threshold_ms=120,
 )
 
 
