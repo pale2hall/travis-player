@@ -1,180 +1,154 @@
 # travis-player
 
-A motion-aware video player with per-pixel transparency. Static regions of the
-video fade to transparent so you can see your desktop / other apps through them,
-while regions where things are actually moving stay opaque. The threshold,
-softness, persistence, region-shape rules, and noise-rejection are all tunable
-live via a separate control panel.
+**A video player where only the motion is visible.** Static regions of the frame
+fade to actual OS-level transparency — you see your desktop through the parts of
+the video where nothing is happening. The moving parts stay opaque and play
+normally, audio and all.
+
+And since v2, it does this by reading **the motion vectors already inside the
+video file** — the ones the encoder computed when the video was compressed —
+instead of computing motion itself.
 
 ![intro shot showing the King of Queens intro composited over Task Manager](notes/screenshot.png)
 
-## Why this exists
+## The idea
 
-Most of the pixels in any given video frame don't change frame-to-frame. The
-framing on a sitcom is mostly the same kitchen for 22 minutes. The point of
-this player is to figure out — cheaply — which pixels are actually carrying
-motion information and let everything else get out of the way.
+A compressed video is not a stack of pictures. It's one picture followed by
+instructions: *this 16×16 block didn't change; this block moved 3px left; this
+block is new.* Every h.264 P-frame is a per-macroblock map of exactly where the
+motion is — computed once, by the encoder, possibly years ago, and shipped
+inside every copy of the file.
 
-## Architecture
+Normal players decode all of that into flat RGB and throw the map away.
+v1 of this project did too — then spent CPU re-deriving a worse version of it
+by diffing consecutive frames. Every frame. Even when the scene was a static
+sitcom kitchen for 22 minutes.
 
-```
-┌──────────────────────┐     QImage     ┌──────────────────────┐
-│  FrameWorker         │  ───signal───▶ │  PlayerWindow        │
-│  (QThread)           │                │  (PyQt6 frameless    │
-│                      │                │   translucent)       │
-│  cv2.VideoCapture    │                │                      │
-│  → BGR frame         │                │  paints RGBA at      │
-│  → diff @ proc res   │                │   OS-level alpha     │
-│  → activity mask     │                │                      │
-│  → RGBA composite    │                │                      │
-└──────────────────────┘                └──────────────────────┘
-                                                  │
-                                          shared Params
-                                                  │
-                                        ┌─────────▼──────────┐
-                                        │  ControlPanel      │
-                                        │  (sliders, persist │
-                                        │   to settings.json)│
-                                        └────────────────────┘
+v2 keeps the map:
 
-         ┌─────────────────────────────────────────────────┐
-         │  AudioController                                │
-         │  → mpv subprocess (--no-video)                  │
-         │  → IPC named pipe for pause/resume              │
-         │  → Windows Job Object so it dies with parent    │
-         └─────────────────────────────────────────────────┘
-```
+1. **Decode with motion vectors exported** (PyAV / FFmpeg `flags2 +export_mvs`).
+   ~7,800 vectors per P-frame on 1080p TV content. Skip-coded blocks — the ones
+   the encoder didn't even bother re-sending — are *guaranteed static* and cost
+   nothing.
+2. **Scatter MV magnitudes into a macroblock grid** (~120×68 cells for 1080p).
+   That tiny grid is the activity mask. No full-frame pixel work.
+3. **Shape it** — threshold, persistence with decay, dilation, feather, falloff
+   curve — all at grid resolution, where it's effectively free.
+4. **Composite only the tiles that visibly changed** into a persistent RGBA
+   buffer, and repaint only those rects. A fully static scene composites
+   *zero* tiles and repaints *nothing*.
 
-### The motion-mask pipeline (per frame)
+### The numbers (Ryzen 9 9950X3D, 1080p 23.976fps)
 
-1. **Decode** with `cv2.VideoCapture` → BGR frame at full video resolution
-2. **Downscale** to `1/proc_div` per axis for the diff math (cheap)
-3. **Frame diff** vs previous downsampled luma → raw activity mask
-4. **Edge sensitivity** — multiply by Sobel-derived edge magnitude so
-   compression noise on flat backgrounds is suppressed
-5. **Scene-cut rejection** — if active fraction > threshold, drop this
-   frame's diff (cuts and brightness flashes look like motion-everywhere
-   but aren't)
-6. **Min-region filter** — `cv2.connectedComponentsWithStats` rejects
-   blobs smaller than the configured size (kills speckle/grain)
-7. **Persistence** — running max with linear decay, so areas that moved
-   recently stay visible for N seconds before fading
-8. **Padding** — `cv2.dilate` to expand the mask outward, keeping
-   fast-moving edges fully opaque
-9. **Feather** — gaussian blur for soft transitions
-10. **Falloff curve** — power LUT shaping the active→static ramp
-11. **Upscale** to full video resolution, build the RGBA output (premultiplied),
-    deep-copy the QImage so the worker can reuse the buffer next frame
+| scene | v1 (full-frame pixel diff) | v2 (codec-driven) |
+|---|---|---|
+| motion-heavy intro | ~11 ms/frame, every frame | ~18 ms (everything's moving — fair) |
+| typical dialogue | ~11 ms/frame, every frame | 3–10 ms, dozens of tiles |
+| static scene | ~11 ms/frame, every frame | **~2.8 ms, 0 tiles repainted** |
 
-All region-size parameters are specified as **pixels at 1080p reference** and
-auto-scale based on the actual video height (`_ref_to_proc_px`), so the same
-slider value gives the same visual feel on a 480p clip and a 4K stream.
+The player's cost now scales with *how much is actually happening on screen*,
+which was the whole point.
 
-### Why this and not the original mpv-fork plan
+### The RTX 5090 plot twist
 
-The original plan in `notes/plan.md` was Route A: fork mpv and add the
-transparency pipeline in C against the render path. We tried it (see
-`shaders/` which is now obsolete) and found mpv 0.36's GLSL hook system
-schedules `//!SAVE` and `//!BIND` on the same texture so that within one frame
-the save can run before the bind — meaning frame-to-frame state isn't
-achievable without forking the C source. The MSYS2 build environment also
-isn't on this machine. Switching to a Python pipeline gave us proper frame
-history AND real OS-level window transparency (PyQt6 `WA_TranslucentBackground`)
-that pure mpv can't do alone, in a fraction of the engineering hours.
+We wired the compositing math to the GPU (CuPy/CUDA, works fine on Blackwell)
+and it was… a wash. Profiling showed the per-frame math is ~3 ms on CPU and the
+PCIe round-trip costs more than the compute. This workload is memory-bound, not
+compute-bound — a 5090 has nothing to chew on at 1080p. The GPU backend ships
+anyway (`Engine → GPU compositing`, default off) because at 4K+ the math should
+flip the verdict. The receipts are in `v2/spikes/gpu_truth.py`.
 
-## Setup
+The honest GPU win — an end-to-end GPU display path with no CPU readback — is
+deliberately deferred. NVDEC hardware decode was ruled out on purpose: it's
+fixed-function and *strips the motion vectors*, which would delete the thesis.
 
-Requires Python 3.10+ (this dev box has 3.13) and `mpv` on PATH for audio.
+## Watch it think
+
+The control panel ships debug views that make the pipeline visible:
+
+- **MV / activity heatmap** — the codec's own motion-vector field, live
+- **Dirty-tile map** — exactly which tiles the compositor repaints (and which
+  it skips) each frame
+- **Binary mask** — the stark what-counts-as-motion silhouette
+
+Load preset `06 xray` then `07 tile inspector` and you're watching the encoder's
+20-year-old homework drive a real-time transparency effect.
+
+## Run it
+
+Requires Python 3.10+ and `mpv` on PATH (audio sidecar).
 
 ```powershell
+git clone <this repo> ; cd travis-player
 python -m venv .venv
-.venv\Scripts\pip install PyQt6 opencv-python numpy
+.venv\Scripts\pip install PyQt6 opencv-python numpy av
+# optional GPU backend:  .venv\Scripts\pip install "cupy-cuda12x[ctk]"
+
+.\launch_v2.ps1 "path\to\video.mp4"
+.\launch_v2.ps1 "https://example.com/stream.m3u8"   # streams work too
 ```
 
-## Run
+Or directly: `.venv\Scripts\python -m v2 "video.mp4"`.
 
-```powershell
-.\launch.ps1                                # uses first video file in this dir
-.\launch.ps1 "path\to\video.mp4"
-.\launch.ps1 "https://example.com/stream.m3u8"
-.\launch.ps1 -Console                       # keep console for python errors
-```
+Drag-and-drop a file or a stream URL onto either window to swap sources live.
 
-The launcher runs `pythonw.exe` detached and tails the log file briefly to
-catch immediate-exit failures.
+### Controls
 
-## Controls
+| key / mouse | action |
+|---|---|
+| Space | pause / resume |
+| F / F11 / double-click | fullscreen |
+| R | reset window geometry |
+| Q / Esc | quit |
+| drag top bar / edges | move / resize the frameless window |
+| hover bottom edge | seek + volume bars |
 
-### Player window
-| key             | action                              |
-|-----------------|-------------------------------------|
-| Space           | pause/resume (audio + video)        |
-| F11 / dbl-click | toggle fullscreen                   |
-| R               | reset window size + position        |
-| Q / Esc         | quit                                |
-| drag (top bar)  | move window                         |
-| drag (corners/edges) | resize                         |
-| drop file/url   | swap source                         |
+The control panel has live sliders for everything (threshold, feather,
+persistence, falloff, …), **Auto** buttons that derive block/tile sizes from
+the current stream's codec and resolution, and 18 curated presets — from
+`01 ghost` (pure motion) through `05 halo bloom` to `18 strobe`. Each preset
+JSON carries a `_note` explaining what it's for.
 
-The chrome (top drag bar + bottom-right resize grip) appears on hover.
-
-### Control panel
-
-Same `R` key resets both windows' geometry. Sliders are organized into:
-
-- **View** — debug mode (normal / heatmap / binary mask / off)
-- **Visibility** — alpha floor for static regions
-- **Motion detection** — threshold, edge sensitivity, min region size
-- **Region shape** — padding, feather, feather falloff curve
-- **Temporal** — persistence, scene-cut ignore + threshold
-- **Compute** — proc divisor
-
-Every slider has a tooltip explaining what it does.
-
-## What gets persisted
-
-`settings.json` (project dir) auto-saves on every change and on app close:
-
-- All tunable parameters
-- Both windows' size and position
-
-Old settings files with renamed fields are silently ignored — defaults take over.
-
-## Presets
-
-The control panel has a Presets group at the top. Type a name and hit Save
-to write `presets/<name>.json` (just the look-tuning fields — window
-geometry isn't included so loading a preset doesn't move your windows).
-The dropdown re-scans the `presets/` folder every time you open it, so
-deleting a preset is just `del presets\old.json` outside the app.
-
-Loading a preset also writes those values to `settings.json`, so the
-loaded look is the new running default if you quit and relaunch.
-
-## Logs
-
-`logs/travis.log` (rotating, 3 × 2MB). Captures lifecycle, perf stats every
-60 frames (`proc=11.3ms avg, real_fps=22.8, late=1/60`), audio sidecar pid,
-and uncaught exceptions via `sys.excepthook`.
-
-## Known limitations
-
-- Audio sync is approximate — the audio sidecar mpv runs independently
-  and may drift over long playback. Pause/resume is honored via IPC.
-- 1080p processing comfortably runs at 23.98fps on a Ryzen 9 9950X3D.
-  4K may need `proc_div ≥ 16`.
-- Drag-drop loads via `cv2.VideoCapture` which uses FFmpeg under the
-  hood — most stream protocols work (HTTP, RTSP, HLS) but exotic
-  formats may not.
-
-## Project layout
+## Architecture (v2)
 
 ```
-travis_player.py          main app (worker, player, controls, audio)
-launch.ps1                detached launcher with health check
-settings.json             auto-saved params + window geometry
-logs/travis.log           rotating runtime log
-notes/                    planning + design docs
-shaders/                  obsolete mpv GLSL approach (kept for reference)
-scripts/                  obsolete mpv lua + build scripts
+v2/
+  decode.py    PyAV decoder, export_mvs on → RGB + motion vectors + pts
+  motion.py    MVs → macroblock activity grid (pixel-diff fallback for I-frames)
+  mask.py      grid-resolution shaping: threshold/persist/dilate/feather/falloff
+  compose.py   dirty-tile compositor — persistent RGBA buffer, visibility-gated
+  clock.py     master clock: video chases wall time, drops to catch up (A/V lock)
+  gpu.py       optional CuPy compositing backend (auto CPU fallback)
+  worker.py    QThread orchestration + perf telemetry
+  player.py    frameless translucent window, dirty-rect repaint
+  controls.py  live-tuning panel, presets, debug views, stream-aware Auto
+  audio.py     mpv --no-video sidecar over a named pipe, Job-Object lifetime
+  spikes/      the receipts: MV-export gate, per-stage profiler, GPU benchmarks
 ```
+
+Three decisions carry the design:
+
+- **Visibility-gated dirty detection.** Real-world rips code ~96% of macroblocks
+  every frame (film grain), so "has a motion vector" can't mean "needs repaint."
+  A tile recomposites only if its alpha changed *or* it has motion **and** is
+  actually visible. A ghost at 5% alpha doesn't get refreshed — you can't see it.
+- **Change detection runs at grid resolution.** A static frame never touches a
+  full-resolution buffer at all.
+- **One clock.** Video presents against wall time (which is what mpv's audio
+  follows) and drops frames to stay honest. v1 paced by sleeping a frame period
+  and accumulated drift; v2 can't.
+
+## History: v1
+
+`travis_player.py` is the previous generation — same effect, computed the hard
+way (`cv2.VideoCapture` + full-frame diff at 1/8 resolution + per-frame full
+RGBA rebuild). It works and stays runnable (`.\launch.ps1`), and its
+`notes/implementation.md` documents the journey, including the failed first
+attempt to do this inside mpv's GLSL shader hooks (cross-frame state isn't a
+thing there — the post-mortem is in the notes).
+
+## License / provenance
+
+An art-piece-slash-experiment about how much of a video player's work is
+already done by the file it's playing. Built with PyQt6, PyAV, OpenCV, NumPy,
+mpv — and an unreasonable amount of profiling.
