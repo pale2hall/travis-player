@@ -93,12 +93,46 @@ PyAV / sounddevice would let us decode audio in-process, but:
 Cost: pause/resume is sub-frame-accurate but seek/scrub aren't synced
 between the video and audio paths. Acceptable for a prototype.
 
+## Playback bar + volume bar (overlay)
+
+Both controls are painted directly on the `PlayerWindow` in `paintEvent`
+when the mouse is hovering — no separate widget hierarchy.
+
+Layout at the bottom of the window (40px strip):
+
+```
+[4] [M:SS  48px] [4] [seek track ···fill···] [4] [M:SS  48px] [4] [🔊 18px] [4] [vol track 72px] [4]
+```
+
+- **Seek track**: filled proportional to `pos_ms / dur_ms`. Click or drag
+  to seek. On click, `FrameWorker.request_seek(frac)` sets a `_seek_request`
+  float that the worker reads at the top of its next loop iteration, calling
+  `cap.set(cv2.CAP_PROP_POS_MSEC, target)`. Simultaneously, `AudioController.seek(sec)`
+  sends `{"command":["seek",sec,"absolute"]}` via the named pipe to keep
+  audio in sync.
+- **Volume track**: drag to set `Params.volume` (0–100), immediately sent to
+  mpv via `{"command":["set_property","volume",vol]}`. Persisted to
+  `settings.json` so the level is restored on next launch.
+- `FrameWorker.position_update` (signal) emits `(pos_ms, dur_ms)` once per
+  decoded frame. The main thread updates `_pos_ms/_dur_ms` and calls
+  `update()` (implicitly via `frame_ready`).
+- `_edge_at` suppresses the bottom-edge resize zone while the mouse is
+  hovering (the bar occupies that region). The corner grip (bottom-right
+  22×22px triangle) still works normally.
+
+## AudioController IPC refactor
+
+`_send_ipc(cmd: dict)` is now the single pipe-write helper. `set_paused`,
+`set_volume`, and `seek` all call it. Previously `set_paused` had the
+pipe-write logic inline.
+
 ## Open questions / next steps
 
 - True motion-vector access from H264 streams via PyAV would replace the
   pixel-diff with even cheaper (and more accurate, since they're literally
   the encoder's own motion estimates) mask. Worth trying if perf becomes a
   ceiling.
-- Audio drift over long playback — if it becomes noticeable, periodically
-  re-sync via mpv IPC `seek` to match `cv2.CAP_PROP_POS_MSEC`.
+- Audio drift over long playback — seek bar helps manual correction. Automatic
+  periodic re-sync (`cap.get(CAP_PROP_POS_MSEC)` → mpv IPC seek) still not
+  implemented.
 - 4K HDR sources would need a different pixel format path. Not in scope yet.

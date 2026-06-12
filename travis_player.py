@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections import deque
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, fields
 from logging.handlers import RotatingFileHandler
@@ -62,7 +63,7 @@ def _setup_logging() -> None:
         log.critical("UNCAUGHT EXCEPTION:\n%s", "".join(traceback.format_exception(exc_type, exc, tb)))
     sys.excepthook = _excepthook
 from PyQt6.QtCore import (
-    QObject, QPoint, Qt, QThread, pyqtSignal,
+    QObject, QPoint, QRect, Qt, QThread, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QDragEnterEvent, QDropEvent, QImage, QKeyEvent, QMouseEvent,
@@ -163,15 +164,13 @@ class AudioController:
         log.info("audio sidecar started pid=%d  pipe=%s  job=%s",
                  self._proc.pid, self.pipe_name, "yes" if in_job else "NO")
 
-    def set_paused(self, paused: bool) -> None:
-        """Send pause command via named pipe. Best-effort — quietly skip on failure."""
+    def _send_ipc(self, cmd: dict) -> None:
+        """Send a JSON command to mpv via named pipe. Best-effort — quietly skips on failure."""
         if self._proc is None or self._proc.poll() is not None:
             return
-        cmd = (
-            '{"command":["set_property","pause",%s]}\n' % ("true" if paused else "false")
-        ).encode("utf-8")
         if sys.platform != "win32":
             return
+        data = (json.dumps(cmd) + "\n").encode("utf-8")
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             GENERIC_WRITE = 0x40000000
@@ -183,11 +182,20 @@ class AudioController:
                 return
             try:
                 written = wintypes.DWORD(0)
-                kernel32.WriteFile(handle, cmd, len(cmd), ctypes.byref(written), None)
+                kernel32.WriteFile(handle, data, len(data), ctypes.byref(written), None)
             finally:
                 kernel32.CloseHandle(handle)
         except Exception:
-            log.exception("audio pause IPC failed")
+            log.exception("audio IPC failed")
+
+    def set_paused(self, paused: bool) -> None:
+        self._send_ipc({"command": ["set_property", "pause", paused]})
+
+    def set_volume(self, vol: int) -> None:
+        self._send_ipc({"command": ["set_property", "volume", max(0, min(100, vol))]})
+
+    def seek(self, pos_sec: float) -> None:
+        self._send_ipc({"command": ["seek", pos_sec, "absolute"]})
 
     def stop(self) -> None:
         if self._proc is None:
@@ -255,11 +263,18 @@ class Params:
     feather_falloff: float = 1.0      # power curve on the feathered mask: <1 softer, =1 linear, >1 harder cutoff
     min_region_px_1080: int = 0       # minimum motion blob extent — smaller blobs treated as noise
     edge_sensitivity: float = 0.0     # 0=ignore edges, 1=only keep motion in textured areas
+    push_full: int = 0                # 0=off, 1-100: push any mask pixel above this % to full opacity before feathering
 
     # --- temporal ---
     persist_seconds: float = 0.5      # how long active regions stay visible after motion stops (0..5)
     scene_cut_ignore: bool = True     # drop frames where almost everything changed at once (cuts/flashes)
     scene_cut_thresh: float = 0.7     # fraction of "active" pixels that counts as a scene change
+
+    # --- dynamic auto-tuning ---
+    dynamic_mode: bool = False        # auto-tune threshold + persistence to hit target visible fraction
+    dynamic_target: float = 0.20     # target fraction of pixels that are "active" (0..1)
+    dynamic_band: float = 0.04       # thermostat band: don't act within ±band of target (0..0.15)
+    dynamic_window: int = 10         # rolling average window in seconds (1/5/10/15/30/60)
 
     # --- compute ---
     proc_div: int = 8                 # downscale factor for diff math (1=full res, higher = faster)
@@ -267,6 +282,9 @@ class Params:
     # --- view ---
     debug_mode: int = 0               # 0=normal 1=heatmap 2=binary 3=off
     paused: bool = False              # transient — not saved
+
+    # --- audio ---
+    volume: int = 100                 # mpv volume 0–100
 
     # --- window geometry (auto-saved; -1 = use default) ---
     controls_x: int = -1
@@ -335,6 +353,8 @@ class Params:
 # ─── frame producer thread ──────────────────────────────────────────────────
 class FrameWorker(QObject):
     frame_ready = pyqtSignal(QImage)
+    position_update = pyqtSignal(float, float)   # pos_ms, duration_ms
+    params_updated = pyqtSignal(float)           # measured active_frac (dynamic mode only)
     finished = pyqtSignal()
 
     def __init__(self, video_path: str, params: Params) -> None:
@@ -349,6 +369,17 @@ class FrameWorker(QObject):
         self._video_h: int = 1080
         self._buf_owner: np.ndarray | None = None
         self._falloff_lut: tuple[float, np.ndarray] | None = None  # cached (falloff_value, lut)
+        self._seek_request: float | None = None  # requested position as fraction 0..1
+        self._target_size: tuple[int, int] | None = None  # display size hint for pre-scaling
+        # dynamic mode: rolling window of measured active fractions
+        self._dyn_history: deque[float] = deque()
+        self._dyn_sum: float = 0.0
+        self._dyn_avg: float = 0.0               # kept for perf log
+        self._dyn_emit_count: int = 0
+
+    def request_seek(self, pos_frac: float) -> None:
+        """Thread-safe: set a pending seek position (fraction of total duration)."""
+        self._seek_request = max(0.0, min(1.0, pos_frac))
 
     def _ref_to_proc_px(self, ref_px_1080: int) -> int:
         """Convert a 1080p-reference pixel value to actual proc-resolution pixels."""
@@ -364,7 +395,21 @@ class FrameWorker(QObject):
     def run(self) -> None:
         log.info("worker starting on %s", self.video_path)
         try:
-            self._cap = cv2.VideoCapture(self.video_path)
+            # try hardware-accelerated decode (DXVA2/D3D11 on Windows) — falls back automatically
+            hw_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
+            if hw_any is not None:
+                self._cap = cv2.VideoCapture(
+                    self.video_path, cv2.CAP_FFMPEG,
+                    [cv2.CAP_PROP_HW_ACCELERATION, hw_any],
+                )
+                if not self._cap.isOpened():
+                    self._cap.release()
+                    self._cap = cv2.VideoCapture(self.video_path)
+                    log.info("hw decode unavailable, using software decode")
+                else:
+                    log.info("hw decode requested (VIDEO_ACCELERATION_ANY)")
+            else:
+                self._cap = cv2.VideoCapture(self.video_path)
             if not self._cap.isOpened():
                 log.error("could not open video: %s", self.video_path)
                 self.finished.emit()
@@ -375,7 +420,11 @@ class FrameWorker(QObject):
             h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             n_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self._video_h = h if h > 0 else 1080
+            duration_ms = (n_frames / fps * 1000.0) if fps > 0 and n_frames > 0 else 0.0
             log.info("video: %dx%d @ %.2ffps  %d frames  scale=%.2fx", w, h, fps, n_frames, self._video_h / 1080.0)
+            log.info("dynamic mode: %s  target=%.0f%%",
+                     "ON" if self.params.dynamic_mode else "off",
+                     self.params.dynamic_target * 100)
 
             frame_period = 1.0 / fps
             self._frame_period = frame_period
@@ -388,6 +437,16 @@ class FrameWorker(QObject):
             n_dropped = 0
 
             while self._running:
+                # apply any pending seek
+                if self._seek_request is not None:
+                    req = self._seek_request
+                    self._seek_request = None
+                    if duration_ms > 0:
+                        self._cap.set(cv2.CAP_PROP_POS_MSEC, req * duration_ms)
+                        self._prev_gray_small = None
+                        self._activity = None
+                    next_t = time.monotonic()
+
                 if self.params.paused:
                     time.sleep(0.02)
                     next_t = time.monotonic()
@@ -405,6 +464,8 @@ class FrameWorker(QObject):
                 qimage = self._process(frame_bgr)
                 proc_times.append(time.monotonic() - t0)
                 self.frame_ready.emit(qimage)
+                pos_ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+                self.position_update.emit(pos_ms, duration_ms)
 
                 next_t += frame_period
                 sleep_for = next_t - time.monotonic()
@@ -419,12 +480,16 @@ class FrameWorker(QObject):
                     avg = sum(proc_times) / len(proc_times) * 1000
                     p95 = sorted(proc_times)[int(len(proc_times) * 0.95)] * 1000
                     real_fps = stats_window / max(1e-6, time.monotonic() - stats_t)
+                    dyn_info = (
+                        f"  dyn=ON target={self.params.dynamic_target*100:.0f}% active={self._dyn_avg*100:.0f}%"
+                        if self.params.dynamic_mode else "  dyn=off"
+                    )
                     log.info(
-                        "perf: proc=%.1fms avg / %.1fms p95   real_fps=%.1f   late=%d/%d   div=%d feather=%dpx persist=%.1fs edge=%.2f minR=%d",
+                        "perf: proc=%.1fms avg / %.1fms p95   real_fps=%.1f   late=%d/%d   div=%d feather=%dpx persist=%.1fs edge=%.2f minR=%d%s",
                         avg, p95, real_fps, n_dropped, stats_window,
                         self.params.proc_div, self.params.feather_px_1080,
                         self.params.persist_seconds, self.params.edge_sensitivity,
-                        self.params.min_region_px_1080,
+                        self.params.min_region_px_1080, dyn_info,
                     )
                     proc_times.clear()
                     stats_t = time.monotonic()
@@ -461,17 +526,25 @@ class FrameWorker(QObject):
         # ── edge sensitivity: weight motion by local edge strength ──
         # rationale: real motion is mostly carried by textured/edged content (faces, objects).
         # smooth backgrounds that "flicker" from compression noise have little edge content.
+        # note: on highly-textured content (most TV) the Sobel is high everywhere, so this
+        # only has a visible effect when there are genuinely smooth/flat regions in frame.
         es = max(0.0, min(1.0, float(self.params.edge_sensitivity)))
         if es > 0.0 and small_mask.any():
+            active_before = int(cv2.countNonZero(small_mask))
             # int16 sobels → uint8 magnitudes via convertScaleAbs (handles abs+saturation safely)
             sx = cv2.Sobel(small_gray, cv2.CV_16S, 1, 0, ksize=3)
             sy = cv2.Sobel(small_gray, cv2.CV_16S, 0, 1, ksize=3)
             edge = cv2.add(cv2.convertScaleAbs(sx), cv2.convertScaleAbs(sy))
-            # build gate uint8 image: (1-es)*255 (no edge) .. 255 (max edge), then multiply
+            # gate: (1-es)*255 in flat regions, up to 255 in edgy regions
             floor_u8 = int(round((1.0 - es) * 255))
             edge_part = cv2.convertScaleAbs(edge, alpha=es)  # range 0 .. es*255
             gate = cv2.add(np.full(edge.shape, floor_u8, dtype=np.uint8), edge_part)
             small_mask = cv2.multiply(small_mask, gate, scale=1.0 / 255.0)
+            active_after = int(cv2.countNonZero(small_mask))
+            if active_before > 0:
+                log.debug("edge(es=%.2f): %d→%d active px (-%d%%)",
+                          es, active_before, active_after,
+                          100 * (active_before - active_after) // max(1, active_before))
 
         # ── scene-cut detection ──
         if self.params.scene_cut_ignore and small_mask.size > 0:
@@ -483,14 +556,22 @@ class FrameWorker(QObject):
         min_ext_proc = self._ref_to_proc_px(self.params.min_region_px_1080)
         if min_ext_proc > 0:
             min_area = min_ext_proc * min_ext_proc
+            active_before = int(cv2.countNonZero(small_mask))
             _, bin_mask = cv2.threshold(small_mask, 32, 255, cv2.THRESH_BINARY)
             n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+            n_blobs = n_labels - 1  # exclude background label 0
             keep = np.zeros(n_labels, dtype=np.uint8)
+            n_kept = 0
             for i in range(1, n_labels):
                 if stats[i, cv2.CC_STAT_AREA] >= min_area:
                     keep[i] = 1
+                    n_kept += 1
             keep_map = keep[labels].astype(np.uint8) * 255
             small_mask = cv2.bitwise_and(small_mask, keep_map)
+            active_after = int(cv2.countNonZero(small_mask))
+            log.debug("minR(%dpx@1080p → %dpx proc, area≥%d): %d/%d blobs kept, %d→%d active px",
+                      self.params.min_region_px_1080, min_ext_proc, min_area,
+                      n_kept, n_blobs, active_before, active_after)
 
         # ── persistence ──
         persist = max(0.0, min(5.0, float(self.params.persist_seconds)))
@@ -498,7 +579,7 @@ class FrameWorker(QObject):
             if self._activity is None or self._activity.shape != small_mask.shape:
                 self._activity = small_mask.copy()
             else:
-                decay_u8 = max(1, int(255 * (self._frame_period / persist)))
+                decay_u8 = min(255, max(1, int(255 * (self._frame_period / persist))))
                 decayed = cv2.subtract(self._activity, np.array([decay_u8], dtype=np.uint8))
                 self._activity = cv2.max(decayed, small_mask)
             small_mask = self._activity
@@ -511,6 +592,15 @@ class FrameWorker(QObject):
             k = 2 * pad_proc + 1
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
             small_mask = cv2.dilate(small_mask, kernel)
+
+        # ── push to full: binary-threshold the mask before feathering ──
+        # any pixel above the threshold becomes fully opaque (255).
+        # the feather step below still runs, so only the *edges* of those
+        # regions get soft — the interior is solid.
+        pf = int(self.params.push_full)
+        if pf > 0:
+            thresh_u8 = max(0, int(pf * 2.55) - 1)  # 1% → thresh=1, 50% → thresh=126
+            _, small_mask = cv2.threshold(small_mask, thresh_u8, 255, cv2.THRESH_BINARY)
 
         # ── feather: gaussian blur for soft edges (in 1080p-ref pixels) ──
         feather_proc = self._ref_to_proc_px(self.params.feather_px_1080)
@@ -530,6 +620,61 @@ class FrameWorker(QObject):
 
         # upscale mask to full res with linear interpolation (smooth feathering)
         mask_u8 = cv2.resize(small_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # ── dynamic auto-tuning: thermostat controller ──
+        # uses a rolling window average (not EMA) so a single action scene
+        # can't whip the sliders.  only acts when the window average is
+        # *outside* the thermostat band — like a real thermostat.
+        # steps are scaled by frame_period so they are fps-independent.
+        if self.params.dynamic_mode:
+            active_frac = float(cv2.countNonZero(mask_u8)) / max(1, mask_u8.size)
+
+            # maintain rolling window (O(1) with running sum)
+            window_n = max(12, int(self.params.dynamic_window / max(1e-6, self._frame_period)))
+            while len(self._dyn_history) >= window_n:
+                self._dyn_sum -= self._dyn_history.popleft()
+            self._dyn_history.append(active_frac)
+            self._dyn_sum += active_frac
+            self._dyn_avg = self._dyn_sum / len(self._dyn_history)
+
+            # only act once we have at least 20% of the window filled
+            if len(self._dyn_history) >= max(6, window_n // 5):
+                error = self._dyn_avg - self.params.dynamic_target
+                band = max(0.005, float(self.params.dynamic_band))
+
+                if abs(error) > band:
+                    direction = 1.0 if error > 0 else -1.0
+                    old_t, old_p = self.params.threshold, self.params.persist_seconds
+
+                    # threshold: primary knob (~0.012/s, fps-independent)
+                    self.params.threshold = float(np.clip(
+                        self.params.threshold + 0.012 * self._frame_period * direction,
+                        0.005, 0.25,
+                    ))
+                    # persistence: secondary, ~3× slower (~0.12 s/s)
+                    self.params.persist_seconds = float(np.clip(
+                        self.params.persist_seconds - 0.12 * self._frame_period * direction,
+                        0.0, 5.0,
+                    ))
+
+                    self._dyn_emit_count += 1
+                    if self._dyn_emit_count >= 3:
+                        self._dyn_emit_count = 0
+                        log.debug(
+                            "dyn: win=%ds n=%d avg=%.1f%% tgt=%.1f%% err=%+.1f%%  "
+                            "thresh %.3f→%.3f  persist %.2f→%.2fs",
+                            self.params.dynamic_window, len(self._dyn_history),
+                            self._dyn_avg * 100, self.params.dynamic_target * 100, error * 100,
+                            old_t, self.params.threshold,
+                            old_p, self.params.persist_seconds,
+                        )
+                        self.params_updated.emit(self._dyn_avg)
+                else:
+                    # inside the band: still refresh the status label occasionally
+                    self._dyn_emit_count += 1
+                    if self._dyn_emit_count >= 3:
+                        self._dyn_emit_count = 0
+                        self.params_updated.emit(self._dyn_avg)
 
         mode = self.params.debug_mode
         if mode == 3:
@@ -563,6 +708,16 @@ class FrameWorker(QObject):
             premul = cv2.multiply(rgb, a3, scale=1.0 / 255.0)
             rgba = cv2.merge([premul[..., 0], premul[..., 1], premul[..., 2], scaled])
 
+        # pre-scale to display size on the worker thread so paintEvent just blits
+        ts = self._target_size
+        if ts is not None:
+            tw, th = ts
+            scale = min(tw / w, th / h)
+            dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
+            if dw != w or dh != h:
+                rgba = cv2.resize(rgba, (dw, dh), interpolation=cv2.INTER_LINEAR)
+                w, h = dw, dh
+
         # build QImage referencing numpy buffer, then deep-copy so it owns its data.
         # without copy(): we'd reuse the buffer next frame and blow up the previous
         # QImage that's still in flight through the signal/slot queue → silent crash.
@@ -576,6 +731,9 @@ class FrameWorker(QObject):
 
 # ─── transparent video window ───────────────────────────────────────────────
 class PlayerWindow(QWidget):
+    position_changed = pyqtSignal(float, float)  # pos_ms, duration_ms — forwarded from worker
+    params_updated = pyqtSignal(float)           # active_frac — forwarded from worker (dynamic mode)
+
     def __init__(self, video_path: str, params: Params) -> None:
         super().__init__()
         self.params = params
@@ -602,17 +760,29 @@ class PlayerWindow(QWidget):
         self._chrome_h = 28          # height of the top drag bar
         self._grip_size = 22         # bottom-right resize grip
 
+        # bottom overlay bar (seek + volume)
+        self._BAR_H = 40
+        self._pos_ms: float = 0.0
+        self._dur_ms: float = 0.0
+        self._seek_dragging: bool = False
+        self._vol_dragging: bool = False
+
         self._thread = QThread(self)
         self._worker = FrameWorker(video_path, self.params)
+        self._worker._target_size = (params.player_w, params.player_h)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.frame_ready.connect(self._on_frame)
+        self._worker.position_update.connect(self._on_position)
+        self._worker.params_updated.connect(self.params_updated)
         self._worker.finished.connect(self._thread.quit)
         self._thread.start()
 
         # audio sidecar (IPC-driven, can pause/resume without restart)
         self._audio = AudioController(video_path)
         self._audio.start()
+        if params.volume != 100:
+            self._audio.set_volume(params.volume)
 
     def _on_frame(self, qimage: QImage) -> None:
         self._pixmap = QPixmap.fromImage(qimage)
@@ -624,15 +794,11 @@ class PlayerWindow(QWidget):
         p.fillRect(self.rect(), Qt.GlobalColor.transparent)
 
         if self._pixmap is not None:
-            scaled = self._pixmap.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
+            # worker pre-scales to display size; just center and blit (no CPU scale here)
+            x = (self.width() - self._pixmap.width()) // 2
+            y = (self.height() - self._pixmap.height()) // 2
             p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            p.drawPixmap(x, y, scaled)
+            p.drawPixmap(x, y, self._pixmap)
 
         # ── chrome: visible drag bar + resize grip when hovered ──
         if self._hovered and not self.isFullScreen():
@@ -669,10 +835,118 @@ class PlayerWindow(QWidget):
             p.setPen(Qt.GlobalColor.white)
             p.drawText(10, y_top + 22, self._osd_text)
 
+        # ── bottom overlay: seek bar + volume bar ──
+        if self._hovered and not self.isFullScreen():
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            W, H = self.width(), self.height()
+            bar_y = H - self._BAR_H
+
+            # background strip
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(20, 20, 20, 200)))
+            p.drawRect(0, bar_y, W, self._BAR_H)
+
+            center_y = bar_y + self._BAR_H // 2
+            text_y = center_y + 5  # baseline offset for text
+
+            # elapsed time label
+            def _fmt(ms: float) -> str:
+                s = int(ms / 1000)
+                return f"{s // 60}:{s % 60:02d}"
+
+            p.setPen(QColor(200, 200, 200))
+            p.drawText(self._PAD, text_y, _fmt(self._pos_ms))
+
+            # total time label
+            sr = self._seek_rect()
+            total_x = sr.right() + self._PAD
+            p.drawText(total_x, text_y, _fmt(self._dur_ms))
+
+            # ── seek track ──
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(80, 80, 80)))
+            p.drawRoundedRect(sr, 3, 3)
+
+            if self._dur_ms > 0:
+                filled_w = max(0, int(sr.width() * min(1.0, self._pos_ms / self._dur_ms)))
+                if filled_w > 0:
+                    p.setBrush(QBrush(QColor(255, 255, 255, 220)))
+                    p.drawRoundedRect(QRect(sr.x(), sr.y(), filled_w, sr.height()), 3, 3)
+
+                # thumb
+                thumb_x = sr.x() + int(sr.width() * min(1.0, self._pos_ms / self._dur_ms))
+                p.setBrush(QBrush(QColor(255, 255, 255)))
+                p.drawEllipse(thumb_x - 5, sr.y() - 3, 10, 12)
+
+            # ── volume icon ──
+            icon_x = sr.right() + self._PAD + self._TIME_W + self._PAD
+            p.setPen(QColor(200, 200, 200))
+            p.drawText(icon_x, text_y, "🔊" if self.params.volume > 0 else "🔇")
+
+            # ── volume track ──
+            vr = self._vol_rect()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(80, 80, 80)))
+            p.drawRoundedRect(vr, 3, 3)
+            vol_filled = max(0, int(vr.width() * (self.params.volume / 100.0)))
+            if vol_filled > 0:
+                p.setBrush(QBrush(QColor(100, 200, 100, 220)))
+                p.drawRoundedRect(QRect(vr.x(), vr.y(), vol_filled, vr.height()), 3, 3)
+            # thumb
+            vol_thumb_x = vr.x() + vol_filled
+            p.setBrush(QBrush(QColor(200, 255, 200)))
+            p.drawEllipse(vol_thumb_x - 5, vr.y() - 3, 10, 12)
+
     def osd(self, text: str, seconds: float = 1.5) -> None:
         self._osd_text = text
         self._osd_until = time.monotonic() + seconds
         self.update()
+
+    def _on_position(self, pos_ms: float, dur_ms: float) -> None:
+        self._pos_ms = pos_ms
+        self._dur_ms = dur_ms
+        self.position_changed.emit(pos_ms, dur_ms)
+
+    def set_volume(self, vol: int) -> None:
+        vol = max(0, min(100, vol))
+        self.params.volume = vol
+        self._audio.set_volume(vol)
+        self.params.save()
+        self.update()
+
+    def seek_to(self, pos_frac: float) -> None:
+        """Seek to pos_frac (0..1 of total duration)."""
+        self._worker.request_seek(pos_frac)
+        if self._dur_ms > 0:
+            self._audio.seek(pos_frac * self._dur_ms / 1000.0)
+
+    # ── overlay geometry helpers ──
+    # layout: [4] [elapsed 48] [4] [seek=====] [4] [total 48] [4] [🔊 18] [4] [vol===] [4]
+    _VOL_W = 72
+    _TIME_W = 48
+    _PAD = 4
+    _ICON_W = 18
+
+    def _seek_rect(self):
+        """Returns QRect of the seek track within the window."""
+        W, H = self.width(), self.height()
+        bar_y = H - self._BAR_H
+        left_edge = self._PAD + self._TIME_W + self._PAD
+        right_edge = W - (self._PAD + self._TIME_W + self._PAD + self._ICON_W + self._PAD + self._VOL_W + self._PAD)
+        track_w = max(10, right_edge - left_edge)
+        track_y = bar_y + (self._BAR_H - 6) // 2
+        return QRect(left_edge, track_y, track_w, 6)
+
+    def _vol_rect(self):
+        """Returns QRect of the volume track within the window."""
+        W, H = self.width(), self.height()
+        bar_y = H - self._BAR_H
+        x = W - self._PAD - self._VOL_W
+        track_y = bar_y + (self._BAR_H - 6) // 2
+        return QRect(x, track_y, self._VOL_W, 6)
+
+    def _in_bar(self, pos) -> bool:
+        return pos.y() >= self.height() - self._BAR_H
 
     # drag-to-move + edge-resize for the frameless window
     _RESIZE_MARGIN = 12  # pixels from edge counted as resize zone
@@ -681,11 +955,13 @@ class PlayerWindow(QWidget):
         m = self._RESIZE_MARGIN
         g = self._grip_size
         x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
-        # the visible bottom-right grip zone always counts as resize
+        # bottom-right grip zone always counts as resize
         if x > w - g and y > h - g:
             return Qt.Edge.RightEdge | Qt.Edge.BottomEdge
         left, right = x < m, x > w - m
-        top, bottom = y < m, y > h - m
+        top = y < m
+        # suppress bottom-edge resize when the overlay bar occupies that strip
+        bottom = (not self._hovered) and (y > h - m)
         edges_val = 0
         if left:   edges_val |= int(Qt.Edge.LeftEdge.value)
         if right:  edges_val |= int(Qt.Edge.RightEdge.value)
@@ -695,34 +971,75 @@ class PlayerWindow(QWidget):
 
     def mousePressEvent(self, e: QMouseEvent) -> None:
         if e.button() == Qt.MouseButton.LeftButton and not self.isFullScreen():
-            edge = self._edge_at(e.position().toPoint())
+            pos = e.position().toPoint()
+            # overlay bar interactions take priority over resize/drag
+            if self._hovered and self._in_bar(pos):
+                sr = self._seek_rect()
+                vr = self._vol_rect()
+                # expand hit area vertically to the full bar strip
+                if sr.x() <= pos.x() <= sr.right() + self._TIME_W:
+                    self._seek_dragging = True
+                    self._apply_seek(pos.x())
+                    return
+                if vr.x() - self._ICON_W - self._PAD <= pos.x() <= vr.right():
+                    self._vol_dragging = True
+                    self._apply_vol(pos.x())
+                    return
+                return  # consumed by bar, don't drag/resize
+            edge = self._edge_at(pos)
             wh = self.windowHandle()
             if edge is not None and wh is not None:
                 wh.startSystemResize(edge)
                 return
             self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
+    def _apply_seek(self, mouse_x: int) -> None:
+        sr = self._seek_rect()
+        frac = max(0.0, min(1.0, (mouse_x - sr.x()) / max(1, sr.width())))
+        self._worker.request_seek(frac)
+        if self._dur_ms > 0:
+            self._audio.seek(frac * self._dur_ms / 1000.0)
+
+    def _apply_vol(self, mouse_x: int) -> None:
+        vr = self._vol_rect()
+        frac = max(0.0, min(1.0, (mouse_x - vr.x()) / max(1, vr.width())))
+        self.set_volume(int(frac * 100))
+
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
+        pos = e.position().toPoint()
+        if e.buttons() & Qt.MouseButton.LeftButton:
+            if self._seek_dragging:
+                self._apply_seek(pos.x())
+                return
+            if self._vol_dragging:
+                self._apply_vol(pos.x())
+                return
+
         # update cursor when hovering edges
         if not self.isFullScreen() and not (e.buttons() & Qt.MouseButton.LeftButton):
-            edge = self._edge_at(e.position().toPoint())
-            cursor_map = {
-                Qt.Edge.LeftEdge:  Qt.CursorShape.SizeHorCursor,
-                Qt.Edge.RightEdge: Qt.CursorShape.SizeHorCursor,
-                Qt.Edge.TopEdge:   Qt.CursorShape.SizeVerCursor,
-                Qt.Edge.BottomEdge: Qt.CursorShape.SizeVerCursor,
-                Qt.Edge.LeftEdge | Qt.Edge.TopEdge:    Qt.CursorShape.SizeFDiagCursor,
-                Qt.Edge.RightEdge | Qt.Edge.BottomEdge: Qt.CursorShape.SizeFDiagCursor,
-                Qt.Edge.RightEdge | Qt.Edge.TopEdge:    Qt.CursorShape.SizeBDiagCursor,
-                Qt.Edge.LeftEdge | Qt.Edge.BottomEdge:  Qt.CursorShape.SizeBDiagCursor,
-            }
-            self.setCursor(cursor_map.get(edge, Qt.CursorShape.ArrowCursor))
+            if self._hovered and self._in_bar(pos):
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                edge = self._edge_at(pos)
+                cursor_map = {
+                    Qt.Edge.LeftEdge:  Qt.CursorShape.SizeHorCursor,
+                    Qt.Edge.RightEdge: Qt.CursorShape.SizeHorCursor,
+                    Qt.Edge.TopEdge:   Qt.CursorShape.SizeVerCursor,
+                    Qt.Edge.BottomEdge: Qt.CursorShape.SizeVerCursor,
+                    Qt.Edge.LeftEdge | Qt.Edge.TopEdge:    Qt.CursorShape.SizeFDiagCursor,
+                    Qt.Edge.RightEdge | Qt.Edge.BottomEdge: Qt.CursorShape.SizeFDiagCursor,
+                    Qt.Edge.RightEdge | Qt.Edge.TopEdge:    Qt.CursorShape.SizeBDiagCursor,
+                    Qt.Edge.LeftEdge | Qt.Edge.BottomEdge:  Qt.CursorShape.SizeBDiagCursor,
+                }
+                self.setCursor(cursor_map.get(edge, Qt.CursorShape.ArrowCursor))
 
         if self._drag_pos is not None and e.buttons() & Qt.MouseButton.LeftButton:
             self.move(e.globalPosition().toPoint() - self._drag_pos)
 
     def mouseReleaseEvent(self, _e: QMouseEvent) -> None:
         self._drag_pos = None
+        self._seek_dragging = False
+        self._vol_dragging = False
 
     def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
@@ -775,6 +1092,7 @@ class PlayerWindow(QWidget):
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         self._save_geometry()
+        self._worker._target_size = (self.width(), self.height())
 
     def moveEvent(self, e) -> None:
         super().moveEvent(e)
@@ -833,15 +1151,20 @@ class PlayerWindow(QWidget):
 
         self._thread = QThread(self)
         self._worker = FrameWorker(source, self.params)
+        self._worker._target_size = (self.width(), self.height())
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.frame_ready.connect(self._on_frame)
+        self._worker.position_update.connect(self._on_position)
+        self._worker.params_updated.connect(self.params_updated)
         self._worker.finished.connect(self._thread.quit)
         self._thread.start()
 
         # new audio with a *fresh* pipe name so nothing collides with the previous
         self._audio = AudioController(source, pipe_name=rf"\\.\pipe\travis-audio-{os.getpid()}-{int(time.monotonic()*1000)}")
         self._audio.start()
+        if self.params.volume != 100:
+            self._audio.set_volume(self.params.volume)
         if self.params.paused:
             self._audio.set_paused(True)
 
@@ -1000,10 +1323,12 @@ class ControlPanel(QWidget):
         self.lbl_minr = QLabel()
         self.lbl_minr.setWordWrap(True)
         gm.addWidget(self.lbl_minr)
-        self.sl_minr = _slider(0, 80, params.min_region_px_1080, self._on_minr)
+        self.sl_minr = _slider(0, 400, params.min_region_px_1080, self._on_minr)
         self.sl_minr.setToolTip(
             "Reject motion blobs smaller than this many pixels (1080p reference). "
-            "Removes single-pixel film grain noise without affecting real moving objects. 0 = off."
+            "At proc_div=8: slider value is divided by 8, then squared for area. "
+            "So 80px → 10 proc px → area≥100. 400px → 50 proc px → area≥2500. "
+            "Check DEBUG logs to see how many blobs are being filtered. 0 = off."
         )
         gm.addWidget(self.sl_minr)
         v.addWidget(gb_mot)
@@ -1041,6 +1366,18 @@ class ControlPanel(QWidget):
             "1.0 = linear. >1.0 = harder cutoff (most of the region stays opaque, edge drops fast)."
         )
         gs.addWidget(self.sl_falloff)
+
+        self.lbl_push_full = QLabel()
+        self.lbl_push_full.setWordWrap(True)
+        gs.addWidget(self.lbl_push_full)
+        self.sl_push_full = _slider(0, 100, params.push_full, self._on_push_full)
+        self.sl_push_full.setToolTip(
+            "Push to full: any mask pixel above this % opacity gets snapped to 100% before feathering. "
+            "0 = off (smooth ramp from motion strength). "
+            "1 = any detectable motion → fully opaque (feather still softens the edges). "
+            "50 = only regions already more than half-visible get pushed solid."
+        )
+        gs.addWidget(self.sl_push_full)
         v.addWidget(gb_shape)
 
         # ── temporal group ──
@@ -1075,6 +1412,69 @@ class ControlPanel(QWidget):
         gt.addWidget(self.sl_scene)
         v.addWidget(gb_t)
 
+        # ── auto-exposure group ──
+        gb_ae = QGroupBox("Auto-exposure")
+        gb_ae.setToolTip(
+            "Automatically tune threshold (aperture) and persistence (shutter) to keep "
+            "a target fraction of the screen visible. Like locking ISO and letting the "
+            "camera pick aperture + shutter."
+        )
+        gae = QVBoxLayout(gb_ae)
+
+        self.cb_dyn = QCheckBox("Enable dynamic mode")
+        self.cb_dyn.setChecked(params.dynamic_mode)
+        self.cb_dyn.toggled.connect(self._on_dyn_toggle)
+        gae.addWidget(self.cb_dyn)
+
+        tgt_row = QHBoxLayout()
+        tgt_row.addWidget(QLabel("Target visible:"))
+        self.sl_dyn_target = _slider(1, 80, int(params.dynamic_target * 100), self._on_dyn_target)
+        self.sl_dyn_target.setToolTip(
+            "Target percentage of pixels that should be 'active' (opaque). "
+            "Threshold and persistence will be nudged to chase this number."
+        )
+        tgt_row.addWidget(self.sl_dyn_target)
+        self.lbl_dyn_target = QLabel(f"{int(params.dynamic_target * 100)}%")
+        tgt_row.addWidget(self.lbl_dyn_target)
+        gae.addLayout(tgt_row)
+
+        band_row = QHBoxLayout()
+        band_row.addWidget(QLabel("Tolerance ±:"))
+        self.sl_dyn_band = _slider(1, 15, int(params.dynamic_band * 100), self._on_dyn_band)
+        self.sl_dyn_band.setToolTip(
+            "Thermostat band: don't touch anything while the rolling average sits within "
+            "±this% of the target. Wider = more stable, slower to react. "
+            "Narrower = tighter but risks oscillation."
+        )
+        band_row.addWidget(self.sl_dyn_band)
+        self.lbl_dyn_band = QLabel(f"±{int(params.dynamic_band * 100)}%")
+        band_row.addWidget(self.lbl_dyn_band)
+        gae.addLayout(band_row)
+
+        win_row = QHBoxLayout()
+        win_row.addWidget(QLabel("Avg window:"))
+        self.cb_dyn_window = QComboBox()
+        _DYN_WINDOWS = [1, 5, 10, 15, 30, 60]
+        self._dyn_window_values = _DYN_WINDOWS
+        self.cb_dyn_window.addItems([f"{s}s" for s in _DYN_WINDOWS])
+        best = min(range(len(_DYN_WINDOWS)), key=lambda i: abs(_DYN_WINDOWS[i] - params.dynamic_window))
+        self.cb_dyn_window.setCurrentIndex(best)
+        self.cb_dyn_window.currentIndexChanged.connect(self._on_dyn_window)
+        self.cb_dyn_window.setToolTip(
+            "How many seconds of frame history the average is computed over. "
+            "Longer = immune to individual scenes; shorter = reacts faster. "
+            "10–15s is a good starting point for typical TV content."
+        )
+        win_row.addWidget(self.cb_dyn_window)
+        gae.addLayout(win_row)
+
+        self.lbl_dyn_status = QLabel("—")
+        self.lbl_dyn_status.setStyleSheet("color: #aaa; font-style: italic;")
+        gae.addWidget(self.lbl_dyn_status)
+
+        v.addWidget(gb_ae)
+        player.params_updated.connect(self._on_params_updated)
+
         # ── compute group ──
         gb_c = QGroupBox("Compute")
         gc = QVBoxLayout(gb_c)
@@ -1088,6 +1488,36 @@ class ControlPanel(QWidget):
         )
         gc.addWidget(self.sl_proc)
         v.addWidget(gb_c)
+
+        # ── playback group (seek + volume) ──
+        gb_pb = QGroupBox("Playback")
+        gp2 = QVBoxLayout(gb_pb)
+
+        pb_row = QHBoxLayout()
+        self.lbl_pos = QLabel("0:00 / 0:00")
+        pb_row.addWidget(self.lbl_pos)
+        gp2.addLayout(pb_row)
+
+        self.sl_seek = QSlider(Qt.Orientation.Horizontal)
+        self.sl_seek.setRange(0, 1000)
+        self.sl_seek.setValue(0)
+        self.sl_seek.setToolTip("Seek position. Drag to jump to any point in the video.")
+        self.sl_seek.sliderMoved.connect(self._on_seek_moved)
+        self.sl_seek.sliderReleased.connect(self._on_seek_released)
+        self._seek_dragging_cp = False
+        gp2.addWidget(self.sl_seek)
+
+        vol_row = QHBoxLayout()
+        vol_row.addWidget(QLabel("Volume"))
+        self.sl_vol = _slider(0, 100, params.volume, self._on_vol)
+        self.sl_vol.setToolTip("Audio volume (0–100). Sent to mpv via IPC immediately.")
+        vol_row.addWidget(self.sl_vol)
+        self.lbl_vol = QLabel(f"{params.volume}%")
+        vol_row.addWidget(self.lbl_vol)
+        gp2.addLayout(vol_row)
+
+        v.addWidget(gb_pb)
+        player.position_changed.connect(self._on_position_update)
 
         # ── action buttons ──
         row = QHBoxLayout()
@@ -1116,15 +1546,21 @@ class ControlPanel(QWidget):
             f"Edge sensitivity:  {p.edge_sensitivity:.2f}    "
             f"({'off' if p.edge_sensitivity == 0 else 'only textured regions' if p.edge_sensitivity >= 0.95 else 'partial weighting'})"
         )
+        proc_px = max(1, round(p.min_region_px_1080 / max(1, p.proc_div))) if p.min_region_px_1080 > 0 else 0
         self.lbl_minr.setText(
-            f"Min region size:  {p.min_region_px_1080} pixels (@1080p)    "
-            f"({'off' if p.min_region_px_1080 == 0 else f'reject blobs smaller than {p.min_region_px_1080}×{p.min_region_px_1080}'})"
+            f"Min region size:  {p.min_region_px_1080}px (@1080p)    "
+            + ("off" if p.min_region_px_1080 == 0 else
+               f"→ {proc_px}px proc → area≥{proc_px*proc_px} proc px")
         )
         self.lbl_padding.setText(f"Padding (expand region):  {p.padding_px_1080} pixels (@1080p)")
         self.lbl_feather.setText(f"Feather (edge softness):  {p.feather_px_1080} pixels (@1080p)")
         self.lbl_falloff.setText(
             f"Feather falloff curve:  {p.feather_falloff:.2f}    "
             f"({'soft halo' if p.feather_falloff < 0.9 else 'linear' if p.feather_falloff < 1.1 else 'sharp cutoff'})"
+        )
+        self.lbl_push_full.setText(
+            "Push to full:  off" if p.push_full == 0 else
+            f"Push to full:  >{p.push_full}% opacity → 100%  (feather still applies to edges)"
         )
         persist_label = f"{p.persist_seconds:.1f}s" if p.persist_seconds > 0 else "off"
         self.lbl_persist.setText(f"Persistence (motion trails):  {persist_label}")
@@ -1183,12 +1619,23 @@ class ControlPanel(QWidget):
             (self.sl_minr,    "setValue",        p.min_region_px_1080),
             (self.sl_padding, "setValue",        p.padding_px_1080),
             (self.sl_feather, "setValue",        p.feather_px_1080),
-            (self.sl_falloff, "setValue",        int(p.feather_falloff * 100)),
-            (self.sl_persist, "setValue",        int(p.persist_seconds * 10)),
+            (self.sl_falloff,    "setValue",        int(p.feather_falloff * 100)),
+            (self.sl_push_full,  "setValue",        p.push_full),
+            (self.sl_persist,    "setValue",        int(p.persist_seconds * 10)),
             (self.cb_scene,   "setChecked",      p.scene_cut_ignore),
             (self.sl_scene,   "setValue",        int(p.scene_cut_thresh * 100)),
             (self.sl_proc,    "setValue",        p.proc_div),
+            (self.sl_vol,        "setValue",        p.volume),
+            (self.cb_dyn,        "setChecked",      p.dynamic_mode),
+            (self.sl_dyn_target, "setValue",        int(p.dynamic_target * 100)),
+            (self.sl_dyn_band,   "setValue",        int(p.dynamic_band * 100)),
         ]
+        # window combo needs special handling (index, not value)
+        best = min(range(len(self._dyn_window_values)),
+                   key=lambda i: abs(self._dyn_window_values[i] - p.dynamic_window))
+        self.cb_dyn_window.blockSignals(True)
+        self.cb_dyn_window.setCurrentIndex(best)
+        self.cb_dyn_window.blockSignals(False)
         for widget, setter, value in widgets_and_values:
             widget.blockSignals(True)
             getattr(widget, setter)(value)
@@ -1219,6 +1666,10 @@ class ControlPanel(QWidget):
         self.params.feather_falloff = v / 100.0
         self._refresh_labels(); self._save()
 
+    def _on_push_full(self, v: int) -> None:
+        self.params.push_full = v
+        self._refresh_labels(); self._save()
+
     def _on_persist(self, v: int) -> None:
         self.params.persist_seconds = v / 10.0
         self._refresh_labels(); self._save()
@@ -1242,6 +1693,75 @@ class ControlPanel(QWidget):
     def _on_proc(self, v: int) -> None:
         self.params.proc_div = v
         self._refresh_labels(); self._save()
+
+    def _on_dyn_toggle(self, on: bool) -> None:
+        self.params.dynamic_mode = on
+        if not on:
+            self.lbl_dyn_status.setText("—")
+        self._save()
+
+    def _on_dyn_target(self, v: int) -> None:
+        self.params.dynamic_target = v / 100.0
+        self.lbl_dyn_target.setText(f"{v}%")
+        self._save()
+
+    def _on_dyn_band(self, v: int) -> None:
+        self.params.dynamic_band = v / 100.0
+        self.lbl_dyn_band.setText(f"±{v}%")
+        self._save()
+
+    def _on_dyn_window(self, idx: int) -> None:
+        self.params.dynamic_window = self._dyn_window_values[idx]
+        self._save()
+
+    def _on_params_updated(self, active_frac: float) -> None:
+        """Dynamic mode fired: update threshold + persistence sliders and status label."""
+        p = self.params
+        for widget, value in (
+            (self.sl_thresh,  int(p.threshold * 1000)),
+            (self.sl_persist, int(p.persist_seconds * 10)),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._refresh_labels()
+        tgt_pct = int(p.dynamic_target * 100)
+        cur_pct = int(active_frac * 100)
+        band_pct = int(p.dynamic_band * 100)
+        lo, hi = tgt_pct - band_pct, tgt_pct + band_pct
+        if lo <= cur_pct <= hi:
+            state = f"✓ settled  [{lo}–{hi}%]"
+        elif cur_pct < lo:
+            state = f"↑ too dark  [{lo}–{hi}%]"
+        else:
+            state = f"↓ too bright  [{lo}–{hi}%]"
+        self.lbl_dyn_status.setText(
+            f"Active: {cur_pct}%  {state}\n"
+            f"thresh={p.threshold:.3f}  persist={p.persist_seconds:.1f}s"
+        )
+
+    def _on_position_update(self, pos_ms: float, dur_ms: float) -> None:
+        if self._seek_dragging_cp:
+            return
+        def _fmt(ms: float) -> str:
+            s = int(ms / 1000)
+            return f"{s // 60}:{s % 60:02d}"
+        self.lbl_pos.setText(f"{_fmt(pos_ms)} / {_fmt(dur_ms)}")
+        if dur_ms > 0:
+            self.sl_seek.blockSignals(True)
+            self.sl_seek.setValue(int(1000 * min(1.0, pos_ms / dur_ms)))
+            self.sl_seek.blockSignals(False)
+
+    def _on_seek_moved(self, v: int) -> None:
+        self._seek_dragging_cp = True
+
+    def _on_seek_released(self) -> None:
+        self._seek_dragging_cp = False
+        self.player.seek_to(self.sl_seek.value() / 1000.0)
+
+    def _on_vol(self, v: int) -> None:
+        self.player.set_volume(v)
+        self.lbl_vol.setText(f"{v}%")
 
     def _toggle_pause(self) -> None:
         new_state = not self.params.paused
